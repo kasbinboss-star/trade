@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.backtest_cache/
+catalyst_log.csv
+.DS_Store
