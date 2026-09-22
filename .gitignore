@@ -3,5 +3,5 @@ __pycache__/
 *.pyc
 *.pyo
 .backtest_cache/
-catalyst_log.csv
+catalyst_log*.csv
 .DS_Store

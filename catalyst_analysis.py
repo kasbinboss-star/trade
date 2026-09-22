@@ -20,12 +20,20 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import yfinance as yf
 
-from news_sentiment import _textblob_polarity, _keyword_boost
+from news_sentiment import (
+    _textblob_polarity, _keyword_boost, fetch_google_news, dedupe_news,
+)
 from options_analysis import fetch_options_flow
+from config import SYMBOL_NAME
 
 logger = logging.getLogger(__name__)
 
 _FRESH_WINDOW_DAYS = 5
+
+# How many (freshest) headlines actually feed the sentiment score. Raised from
+# 12 when Google News was added -- otherwise the wider coverage was collected
+# and then immediately truncated away.
+_MAX_SCORED_HEADLINES = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Forward-tracking log
@@ -41,7 +49,27 @@ _LOG_PATH = Path(__file__).resolve().parent / "catalyst_log.csv"
 _LOG_FIELDS = [
     "timestamp", "symbol", "price", "catalyst_score", "rating_label",
     "options_label", "squeeze_label", "news_score", "earnings_soon",
+    "premarket_pct",
 ]
+
+
+def _rotate_log_if_schema_changed() -> bool:
+    """If an existing log was written with a different set of columns, move it
+    aside rather than appending rows that would silently misalign. Returns
+    True when a fresh header needs writing."""
+    if not _LOG_PATH.exists():
+        return True
+    try:
+        with open(_LOG_PATH, newline="") as f:
+            header = (f.readline() or "").strip().split(",")
+        if header == _LOG_FIELDS:
+            return False
+        _LOG_PATH.rename(_LOG_PATH.with_suffix(".prev.csv"))
+        logger.info("catalyst_log schema changed -- previous log kept as %s",
+                    _LOG_PATH.with_suffix(".prev.csv").name)
+        return True
+    except Exception:
+        return False
 
 
 def log_catalyst_snapshot(symbol: str, price: float, data: dict) -> None:
@@ -49,7 +77,7 @@ def log_catalyst_snapshot(symbol: str, price: float, data: dict) -> None:
     if price <= 0:
         return
     try:
-        is_new = not _LOG_PATH.exists()
+        is_new = _rotate_log_if_schema_changed()
         with open(_LOG_PATH, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=_LOG_FIELDS)
             if is_new:
@@ -64,6 +92,9 @@ def log_catalyst_snapshot(symbol: str, price: float, data: dict) -> None:
                 "squeeze_label":  data.get("squeeze_label") or "",
                 "news_score":     data.get("news_score", 0.0),
                 "earnings_soon":  data.get("earnings_soon", False),
+                # Can't be backtested (yfinance serves only ~30 days of
+                # extended-hours data), so it gets forward-logged instead.
+                "premarket_pct":  data.get("premarket_pct", 0.0),
             })
     except Exception as e:
         logger.debug("Catalyst log write failed for %s: %s", symbol, e)
@@ -158,12 +189,18 @@ def weighted_news_sentiment(news_items: List[dict]) -> Tuple[float, List[str]]:
     now = datetime.now(timezone.utc)
     scored, headlines = [], []
 
-    for item in news_items[:12]:
+    # Score the freshest items first, not merely the first ones supplied. With
+    # two sources merged, ordering by arrival would let one source's stale
+    # headlines crowd out the other's fresh ones.
+    def _age_hours(item: dict) -> float:
+        pub = _parse_pubdate(item)
+        return (now - pub).total_seconds() / 3600 if pub else 999.0
+
+    for item in sorted(news_items, key=_age_hours)[:_MAX_SCORED_HEADLINES]:
         title = _extract_title(item)
         if not title:
             continue
-        pub      = _parse_pubdate(item)
-        hrs_ago  = (now - pub).total_seconds() / 3600 if pub else 999
+        hrs_ago = _age_hours(item)
 
         if   hrs_ago <= 24:  weight = 1.0
         elif hrs_ago <= 72:  weight = 0.6
@@ -299,11 +336,18 @@ def fetch_catalyst(symbol: str) -> dict:
 
     # ── Component 3: recency-weighted news ───────────────────────────────────
     news_score, headlines = 0.0, []
+    news_items = []
     try:
-        news_items           = yf.Ticker(symbol).news or []
-        news_score, headlines = weighted_news_sentiment(news_items)
+        news_items = list(yf.Ticker(symbol).news or [])
     except Exception as e:
-        logger.debug("News fetch failed for %s: %s", symbol, e)
+        logger.debug("Yahoo news fetch failed for %s: %s", symbol, e)
+    # Widen coverage with Google News; both sources feed the same
+    # recency-weighted scorer, de-duplicated by headline.
+    news_items += fetch_google_news(symbol, SYMBOL_NAME.get(symbol, ""))
+    try:
+        news_score, headlines = weighted_news_sentiment(dedupe_news(news_items))
+    except Exception as e:
+        logger.debug("News scoring failed for %s: %s", symbol, e)
 
     # ── Component 4: short squeeze + pre-market (one .info call) ─────────────
     ext = _fetch_extended_info(symbol)

@@ -9,17 +9,12 @@ catalyst layer (catalyst_analysis.py, the other 40% of the live score) is out
 of scope here on purpose — see catalyst_log.csv, which tracks it going forward
 instead of backward.
 
-Methodology, in one pass:
-  1. Simulate point-in-time technical scores across history with NO lookahead,
-     by feeding calculate_short_term_score() (the actual production function)
-     a truncated trailing window ending at each day t.
-  2. Split into an in-sample period and an untouched out-of-sample holdout.
-  3. Compute each factor's Information Coefficient (rank correlation with
-     forward returns) in-sample.
-  4. Propose a re-weighting via one bounded, closed-form transform (not a
-     search/optimization loop).
-  5. Accept the new weights ONLY if they beat the current weights on BOTH
-     tails (BUY bucket and SELL bucket) on the out-of-sample holdout.
+Methodology: simulate point-in-time scores with NO lookahead (feeding the real
+calculate_short_term_score() a trailing window ending at each day t), split
+in-sample vs an untouched out-of-sample holdout, measure each factor's
+Information Coefficient in-sample, propose a re-weighting via one bounded
+closed-form transform (not a search), and accept it ONLY if it beats the
+current weights on BOTH tails out-of-sample.
 
 Usage:
     python backtest.py                     # IC report only
@@ -56,6 +51,8 @@ HORIZONS = (1, 3, 5)
 DECISION_HORIZON = 3
 
 FACTOR_COLS = ["ema_score", "stoch_score", "roc_score", "gap_score", "vol_score", "candle_score"]
+CANDIDATE_COLS = ["rsi2_score", "zscore_score", "range_pos_score"]  # measured, unweighted
+MEASURED_COLS = FACTOR_COLS + CANDIDATE_COLS
 FACTOR_TO_WEIGHT_KEY = {
     "ema_score": "ema", "stoch_score": "stoch", "roc_score": "roc",
     "gap_score": "gap", "vol_score": "volume", "candle_score": "candle",
@@ -95,6 +92,27 @@ def _extract(raw: pd.DataFrame, sym: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def _download_with_retry(tickers, period, interval="1d", auto_adjust=True,
+                          max_attempts=3, base_delay=5.0) -> pd.DataFrame:
+    """yf.download() occasionally returns an empty frame for the WHOLE batch
+    when Yahoo Finance rate-limits/blocks the request -- yfinance then
+    misreports every symbol as "possibly delisted", which is transient, not
+    a real mass-delisting. Retry with backoff before giving up."""
+    raw = pd.DataFrame()
+    for attempt in range(1, max_attempts + 1):
+        raw = yf.download(tickers=tickers, period=period, interval=interval,
+                           auto_adjust=auto_adjust, progress=False, threads=True)
+        if not raw.empty:
+            return raw
+        if attempt < max_attempts:
+            delay = base_delay * attempt
+            console.print(f"[yellow]  yfinance returned empty for all {len(tickers)} symbols "
+                           f"(attempt {attempt}/{max_attempts}) -- likely rate-limited, "
+                           f"retrying in {delay:.0f}s[/yellow]")
+            time.sleep(delay)
+    return raw
+
+
 def load_history(symbols: List[str], years: int, refresh: bool) -> Dict[str, pd.DataFrame]:
     CACHE_DIR.mkdir(exist_ok=True)
     result: Dict[str, pd.DataFrame] = {}
@@ -113,8 +131,7 @@ def load_history(symbols: List[str], years: int, refresh: bool) -> Dict[str, pd.
 
     if to_fetch:
         console.print(f"[yellow]Downloading {len(to_fetch)} symbols ({years}y daily)…[/yellow]")
-        raw = yf.download(tickers=to_fetch, period=f"{years}y", interval="1d",
-                           auto_adjust=True, progress=False, threads=True)
+        raw = _download_with_retry(to_fetch, period=f"{years}y")
         for sym in to_fetch:
             df = _extract(raw, sym)
             if df is not None and len(df) > WARMUP_DAYS + max(HORIZONS):
@@ -150,8 +167,8 @@ def simulate_scores(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         row = {"date": df.index[t]}
-        for f in FACTOR_COLS:
-            row[f] = tech[f]
+        for f in MEASURED_COLS:
+            row[f] = tech.get(f, 0.0)
 
         for h in HORIZONS:
             fut_close = float(df["Close"].iloc[t + h])
@@ -181,7 +198,7 @@ def _spearman(a: pd.Series, b: pd.Series) -> float:
 
 def compute_ic(panel: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for factor in FACTOR_COLS:
+    for factor in MEASURED_COLS:
         for h in HORIZONS:
             ret_col = f"fwd_ret_{h}d"
             sub = panel[[factor, ret_col]].dropna()
@@ -238,12 +255,15 @@ def propose_weights(ic_df: pd.DataFrame, current: Dict[str, float],
         key = FACTOR_TO_WEIGHT_KEY[factor]
         rows = ic_df[ic_df.factor == factor].set_index("horizon")
         pooled_3d = rows.loc[DECISION_HORIZON, "pooled_ic"] if DECISION_HORIZON in rows.index else np.nan
+        # Sign-aware: a negative-IC factor belongs in the score with a NEGATIVE
+        # weight (roc is deliberately negative -- see TECH_WEIGHTS). Normalising
+        # on magnitudes keeps score scale, and thus the thresholds, comparable.
         if passes_materiality(ic_df, factor) and pd.notna(pooled_3d):
-            raw[key] = abs(pooled_3d)
+            raw[key] = float(pooled_3d)
         else:
             raw[key] = current[key] * shrink
 
-    total = sum(raw.values())
+    total = sum(abs(v) for v in raw.values())
     normalized = {k: v / total for k, v in raw.items()}
 
     clipped = {}
@@ -255,7 +275,7 @@ def propose_weights(ic_df: pd.DataFrame, current: Dict[str, float],
             clipped[k] = current[k] - max_delta
         else:
             clipped[k] = v
-    total2 = sum(clipped.values())
+    total2 = sum(abs(v) for v in clipped.values())
     return {k: v / total2 for k, v in clipped.items()}
 
 
@@ -338,8 +358,10 @@ def render_ic_table(ic_df: pd.DataFrame) -> None:
     t.add_column("n", justify="right")
     t.add_column("Verdict")
 
-    for factor in FACTOR_COLS:
+    for factor in MEASURED_COLS:
         diag = factor_diagnosis(ic_df, factor)
+        if factor in CANDIDATE_COLS:
+            diag = f"{diag} (candidate)"
         rows = ic_df[ic_df.factor == factor]
         for _, r in rows.iterrows():
             verdict = diag if r.horizon == DECISION_HORIZON else ""

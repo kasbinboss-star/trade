@@ -71,8 +71,12 @@ def _dominant_technical_reason(snap) -> Tuple[str, float]:
         stoch_label_ = "Stoch bull cross" if snap.stoch_score > 0 else "Stoch bear cross"
     candidates.append((stoch_label_, snap.stoch_score * TECH_WEIGHTS["stoch"] * SHORT_TECH_WEIGHT))
 
+    # ROC carries a negative weight (mean reversion), so a pullback is the
+    # bullish case. Label it that way or a green "-5.0%" reads like a bug.
+    roc_label = (f"Pullback {snap.roc3:+.1f}% 3d" if snap.roc3 < 0
+                 else f"Extended {snap.roc3:+.1f}% 3d")
     candidates.append((
-        f"{snap.roc3:+.1f}% 3d move",
+        roc_label,
         snap.roc_score * TECH_WEIGHTS["roc"] * SHORT_TECH_WEIGHT,
     ))
 

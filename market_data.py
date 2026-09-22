@@ -27,6 +27,29 @@ from news_sentiment import fetch_fundamental
 logger = logging.getLogger(__name__)
 
 
+def _download_with_retry(tickers, period, interval="1d", auto_adjust=True,
+                          max_attempts=3, base_delay=5.0) -> pd.DataFrame:
+    """yf.download() occasionally returns an empty frame for the WHOLE batch
+    when Yahoo Finance rate-limits/blocks the request -- yfinance then
+    misreports every symbol as "possibly delisted", which is transient, not
+    a real mass-delisting. Retry with backoff before giving up."""
+    raw = pd.DataFrame()
+    for attempt in range(1, max_attempts + 1):
+        raw = yf.download(tickers=tickers, period=period, interval=interval,
+                           auto_adjust=auto_adjust, progress=False, threads=True)
+        if not raw.empty:
+            return raw
+        if attempt < max_attempts:
+            delay = base_delay * attempt
+            logger.warning(
+                "yf.download returned empty for all %d symbols (attempt %d/%d) "
+                "-- likely rate-limited by Yahoo, retrying in %.0fs",
+                len(tickers), attempt, max_attempts, delay,
+            )
+            time.sleep(delay)
+    return raw
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Stock snapshot dataclass
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,16 +158,9 @@ class DataManager:
         """Download 1 year of daily OHLCV data and compute initial signals."""
         try:
             logger.info("Downloading 1-year daily history for %d symbols…", len(ALL_SYMBOLS))
-            raw = yf.download(
-                tickers=ALL_SYMBOLS,
-                period="1y",
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-            )
+            raw = _download_with_retry(ALL_SYMBOLS, period="1y")
             if raw.empty:
-                logger.error("yfinance returned empty data")
+                logger.error("yfinance returned empty data after retries")
                 return False
 
             for sym in ALL_SYMBOLS:
@@ -228,39 +244,97 @@ class DataManager:
 
     # ── Live price refresh ────────────────────────────────────────────────────
 
-    def update_prices(self) -> None:
-        """Re-fetch current prices via fast_info (parallel) and patch snapshots."""
-        def _fetch(sym: str):
-            try:
-                fi = yf.Ticker(sym).fast_info
-                price = float(fi.last_price or 0)
-                prev  = float(fi.previous_close or 0)
-                if price > 0 and prev > 0:
-                    return sym, price, prev
-            except Exception as e:
-                logger.debug("fast_info failed %s: %s", sym, e)
-            return None
+    def _fetch_live_prices(self) -> Dict[str, float]:
+        """Current price per symbol from ONE batched intraday request.
 
-        with ThreadPoolExecutor(max_workers=12) as ex:
-            futures = {ex.submit(_fetch, sym): sym for sym in ALL_SYMBOLS}
-            for fut in as_completed(futures):
-                res = fut.result()
-                if res is None:
+        prepost=True so this reflects real pre/after-hours trading. The old
+        per-symbol fast_info loop returned the last *regular session* close
+        during extended hours, and a previous_close that matched no actual
+        bar -- so pre-market moves came out fabricated.
+        """
+        prices: Dict[str, float] = {}
+        try:
+            raw = yf.download(tickers=ALL_SYMBOLS, period="1d", interval="1m",
+                               prepost=True, auto_adjust=False,
+                               progress=False, threads=True)
+        except Exception as e:
+            logger.warning("Live price download failed: %s", e)
+            return prices
+
+        if raw is None or raw.empty:
+            return prices
+
+        try:
+            close_block = raw["Close"]
+        except Exception:
+            return prices
+
+        if isinstance(close_block, pd.Series):          # single-ticker shape
+            series = close_block.dropna()
+            if not series.empty and len(ALL_SYMBOLS) == 1:
+                prices[ALL_SYMBOLS[0]] = float(series.iloc[-1])
+            return prices
+
+        for sym in close_block.columns:
+            series = close_block[sym].dropna()
+            if series.empty:
+                continue
+            val = float(series.iloc[-1])
+            if val > 0:
+                prices[str(sym)] = val
+        return prices
+
+    def _last_bar_is_today(self, hist: pd.DataFrame) -> bool:
+        """True when the final daily bar belongs to the current ET session."""
+        try:
+            import pytz
+            today_et = datetime.now(pytz.timezone("America/New_York")).date()
+            return hist.index[-1].date() == today_et
+        except Exception:
+            return False
+
+    def _reference_close(self, sym: str) -> float:
+        """Last COMPLETED regular-session close -- the correct baseline for a
+        change %. If today's (partial) bar is present, step back one."""
+        hist = self._hist.get(sym)
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return 0.0
+        idx = -2 if (self._last_bar_is_today(hist) and len(hist) >= 2) else -1
+        try:
+            return float(hist["Close"].iloc[idx])
+        except Exception:
+            return 0.0
+
+    def update_prices(self) -> None:
+        prices = self._fetch_live_prices()
+        if not prices:
+            return
+
+        session_open = self.market_status() == "OPEN"
+
+        with self._lock:
+            for sym, price in prices.items():
+                snap = self._snapshots.get(sym)
+                if snap is None:
                     continue
-                sym, price, prev = res
-                change = price - prev
-                pct    = (change / prev * 100) if prev else 0.0
-                with self._lock:
-                    snap = self._snapshots[sym]
-                    snap.price      = price
-                    snap.prev_close = prev
-                    snap.change     = change
-                    snap.change_pct = pct
-                    snap.last_price_update = datetime.now()
-                    # Patch historical data for today to keep vol_score accurate
-                    if sym in self._hist:
-                        self._hist[sym].iloc[-1, self._hist[sym].columns.get_loc("Close")] = price
-                    _compute_signal(snap)
+                ref = self._reference_close(sym)
+                if ref <= 0:
+                    continue
+
+                snap.price      = price
+                snap.prev_close = ref
+                snap.change     = price - ref
+                snap.change_pct = (price - ref) / ref * 100
+                snap.last_price_update = datetime.now()
+
+                # Only the live regular session has a genuinely partial last
+                # bar. Pre/after-hours it is a COMPLETED bar, and patching it
+                # would corrupt the history the indicators score off.
+                hist = self._hist.get(sym)
+                if session_open and hist is not None and self._last_bar_is_today(hist):
+                    hist.iloc[-1, hist.columns.get_loc("Close")] = price
+
+                _compute_signal(snap)
 
     # ── Fundamental refresh ───────────────────────────────────────────────────
 

@@ -149,13 +149,91 @@ def detect_candle_pattern(df: pd.DataFrame) -> Tuple[str, float]:
 
 
 # ─────────────────────────────────────────────
+# Candidate indicators — measured, NOT yet weighted
+# ─────────────────────────────────────────────
+# These are computed on every bar so backtest.py can measure their
+# Information Coefficient, but they carry ZERO weight in short_score until
+# they clear the |IC| > 0.03 bar. Prior backtesting found that none of the
+# existing six factors cleared it, so new ideas get measured, not assumed.
+#
+# All three target short-horizon MEAN REVERSION, which is the effect the
+# literature actually supports at a 1-5 day holding period (momentum's edge
+# shows up at 3-12 months). Windows are kept <= 60 bars so the live manager
+# (which downloads 3 months) computes them identically to the backtest.
+
+def calc_rsi2(close: pd.Series, period: int = 2) -> float:
+    """Very short RSI — the Connors-style mean-reversion oscillator."""
+    if len(close) < period + 1:
+        return 50.0
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    val = (100 - 100 / (1 + rs)).iloc[-1]
+    return float(val) if not np.isnan(val) else 50.0
+
+
+def score_rsi2(rsi2: float) -> float:
+    if rsi2 < 5:   return  2.0
+    if rsi2 < 10:  return  1.5
+    if rsi2 < 25:  return  0.5
+    if rsi2 > 95:  return -2.0
+    if rsi2 > 90:  return -1.5
+    if rsi2 > 75:  return -0.5
+    return 0.0
+
+
+def calc_zscore(close: pd.Series, period: int = 20) -> float:
+    """How many standard deviations price sits from its 20-day mean."""
+    if len(close) < period:
+        return 0.0
+    window = close.tail(period)
+    mu, sd = float(window.mean()), float(window.std())
+    if sd <= 0 or np.isnan(sd):
+        return 0.0
+    return float((float(close.iloc[-1]) - mu) / sd)
+
+
+def score_zscore(z: float) -> float:
+    """Stretched below the mean is bullish under a reversion hypothesis."""
+    return max(-2.0, min(2.0, -z))
+
+
+def calc_range_position(close: pd.Series, period: int = 60) -> float:
+    """0.0 = at the period low, 1.0 = at the period high."""
+    if len(close) < 5:
+        return 0.5
+    window = close.tail(period)
+    lo, hi = float(window.min()), float(window.max())
+    if hi <= lo:
+        return 0.5
+    return (float(close.iloc[-1]) - lo) / (hi - lo)
+
+
+def score_range_position(pos: float) -> float:
+    if pos < 0.10:  return  1.5
+    if pos < 0.25:  return  0.7
+    if pos > 0.90:  return -1.5
+    if pos > 0.75:  return -0.7
+    return 0.0
+
+
+# ─────────────────────────────────────────────
 # Composite short-term score [-2, +2]
 # ─────────────────────────────────────────────
 
 TECH_WEIGHTS = {
     "ema":    0.20,
     "stoch":  0.20,
-    "roc":    0.25,
+    # NEGATIVE ON PURPOSE. roc_score's Information Coefficient came out
+    # consistently negative in BOTH the in-sample and out-of-sample periods,
+    # at all three horizons (IS -0.010/-0.027/-0.025, OOS -0.012/-0.025/-0.024)
+    # -- i.e. rewarding a recent run-up predicted *worse* forward returns, which
+    # matches the literature that 1-5 day equity returns are mean-reverting.
+    # Flipping the sign restored a monotonic score->return ordering OOS and put
+    # the BUY bucket ahead of SPY. Magnitudes still sum to 1.0, so score scale
+    # (and therefore the thresholds) is unchanged.
+    "roc":   -0.25,
     "gap":    0.10,
     "volume": 0.10,
     "candle": 0.15,
@@ -213,7 +291,16 @@ def calculate_short_term_score(df: pd.DataFrame) -> dict:
         candle_score * _WEIGHTS["candle"]
     )
 
+    # Candidate factors: computed for measurement, deliberately excluded from
+    # the weighted short_score above until backtest.py validates them.
+    rsi2      = calc_rsi2(close)
+    zscore    = calc_zscore(close)
+    range_pos = calc_range_position(close)
+
     return {
+        "rsi2": rsi2, "rsi2_score": score_rsi2(rsi2),
+        "zscore": zscore, "zscore_score": score_zscore(zscore),
+        "range_pos": range_pos, "range_pos_score": score_range_position(range_pos),
         "price": price, "change_pct": change_pct,
         "ema5": ema5, "ema10": ema10, "ema20": ema20,
         "stoch_k": k, "stoch_d": d,
@@ -234,6 +321,8 @@ def _empty() -> dict:
         "roc3", "roc5", "atr", "atr_pct", "gap_pct", "volume", "avg_volume",
         "volume_ratio", "ema_score", "stoch_score", "roc_score", "gap_score",
         "vol_score", "candle_score", "short_score",
+        "rsi2", "rsi2_score", "zscore", "zscore_score",
+        "range_pos", "range_pos_score",
     ]}
     d["candle_label"] = "—"
     return d

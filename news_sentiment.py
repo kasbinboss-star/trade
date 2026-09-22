@@ -6,12 +6,72 @@ News score   : TextBlob polarity averaged over recent headlines → [-1, +1].
 """
 
 import logging
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Tuple, List
 
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Google News RSS
+# ─────────────────────────────────────────────────────────────────────────────
+# Yahoo returns ~10 headlines per symbol. Google News publishes a public RSS
+# feed (this is a documented feed, not HTML scraping) which typically returns
+# far more, so the sentiment signal sees a much wider slice of coverage.
+
+_GOOGLE_NEWS_URL = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+_GOOGLE_NEWS_TIMEOUT = 6
+_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+
+
+def fetch_google_news(symbol: str, company_name: str = "", limit: int = 25) -> List[dict]:
+    """Recent headlines for a symbol from Google News RSS.
+
+    Returns items shaped like yfinance news entries so the existing
+    weighted_news_sentiment() consumes them unchanged. Best-effort: on any
+    failure it returns [] rather than raising, since news is a soft signal.
+
+    company_name matters -- bare tickers like "V", "MA" or "O" match enormous
+    amounts of unrelated news, so we search the company name when known.
+    """
+    query = f"{company_name} stock" if company_name else f"{symbol} stock"
+    url = _GOOGLE_NEWS_URL.format(q=urllib.parse.quote(query))
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _UA})
+        with urllib.request.urlopen(req, timeout=_GOOGLE_NEWS_TIMEOUT) as resp:
+            body = resp.read()
+        root = ET.fromstring(body)
+    except Exception as e:
+        logger.debug("Google News fetch failed for %s: %s", symbol, e)
+        return []
+
+    items = []
+    for node in root.findall(".//item")[:limit]:
+        title = (node.findtext("title") or "").strip()
+        if not title:
+            continue
+        items.append({
+            "title": title,
+            "content": {"title": title, "pubDate": (node.findtext("pubDate") or "").strip()},
+        })
+    return items
+
+
+def dedupe_news(items: List[dict]) -> List[dict]:
+    """Drop repeats across sources, matching on a normalised title."""
+    seen, out = set(), []
+    for item in items:
+        title = item.get("title") or item.get("content", {}).get("title", "") or ""
+        key = "".join(ch for ch in title.lower() if ch.isalnum())[:80]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Keyword boosts applied on top of TextBlob polarity

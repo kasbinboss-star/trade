@@ -180,6 +180,9 @@ def main(args: argparse.Namespace) -> None:
             # Auto-trade check (rate-limited internally to TRADE_CHECK_INTERVAL)
             if trader is not None:
                 trader.run(snapshots)
+                # Held names always get full catalyst analysis, so exit
+                # decisions aren't made on technicals alone under tiering.
+                dm.set_priority_symbols(trader.positions.keys())
 
             live.update(build_dashboard(
                 snapshots, dm.market_status(), last_update,

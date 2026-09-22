@@ -5,6 +5,7 @@ fetching threads tuned for fast-moving, few-day trades.
 
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -19,11 +20,35 @@ from config import (
     SHORT_TECH_WEIGHT, SHORT_CATALYST_WEIGHT,
     SHORT_STRONG_BUY_THRESHOLD, SHORT_BUY_THRESHOLD,
     SHORT_SELL_THRESHOLD, SHORT_STRONG_SELL_THRESHOLD,
+    CATALYST_TOP_N, CATALYST_BOTTOM_N, CATALYST_ROTATE_N,
 )
 from short_term_analysis import calculate_short_term_score
 from catalyst_analysis import fetch_catalyst, log_catalyst_snapshot
 
 logger = logging.getLogger(__name__)
+
+
+def _download_with_retry(tickers, period, interval="1d", auto_adjust=True,
+                          max_attempts=3, base_delay=5.0) -> pd.DataFrame:
+    """yf.download() occasionally returns an empty frame for the WHOLE batch
+    when Yahoo Finance rate-limits/blocks the request -- yfinance then
+    misreports every symbol as "possibly delisted", which is transient, not
+    a real mass-delisting. Retry with backoff before giving up."""
+    raw = pd.DataFrame()
+    for attempt in range(1, max_attempts + 1):
+        raw = yf.download(tickers=tickers, period=period, interval=interval,
+                           auto_adjust=auto_adjust, progress=False, threads=True)
+        if not raw.empty:
+            return raw
+        if attempt < max_attempts:
+            delay = base_delay * attempt
+            logger.warning(
+                "yf.download returned empty for all %d symbols (attempt %d/%d) "
+                "-- likely rate-limited by Yahoo, retrying in %.0fs",
+                len(tickers), attempt, max_attempts, delay,
+            )
+            time.sleep(delay)
+    return raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,7 +114,14 @@ class ShortTermSnapshot:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_signal(snap: ShortTermSnapshot) -> None:
-    final = snap.short_score * SHORT_TECH_WEIGHT + snap.catalyst_score * SHORT_CATALYST_WEIGHT
+    # Blend in the catalyst layer only when it was actually fetched. Under
+    # tiered analysis most symbols have no catalyst data, and scoring them as
+    # 0.60*tech + 0.40*0.0 would rank a strong technical setup below a mediocre
+    # one that merely happened to be selected for catalyst analysis.
+    if snap.last_catalyst_update is not None:
+        final = snap.short_score * SHORT_TECH_WEIGHT + snap.catalyst_score * SHORT_CATALYST_WEIGHT
+    else:
+        final = snap.short_score
     snap.final_score = round(final, 3)
 
     if   final >= SHORT_STRONG_BUY_THRESHOLD:   snap.signal = "STRONG BUY"
@@ -129,7 +161,16 @@ class ShortTermDataManager:
             for sym in ALL_SYMBOLS
         }
         self._hist: Dict[str, pd.DataFrame] = {}
+        self._priority_symbols: set = set()   # e.g. currently-held positions
+        self._hist_refreshed_for = None       # date of last intraday hist refresh
+        self._rotate_idx = 0                  # catalyst rotation cursor
         self.stop_event = threading.Event()
+
+    def set_priority_symbols(self, symbols) -> None:
+        """Always get full catalyst analysis regardless of rank -- typically
+        open positions, so exit decisions keep complete data."""
+        with self._lock:
+            self._priority_symbols = set(symbols or ())
 
     # ── Initialisation ────────────────────────────────────────────────────────
 
@@ -137,16 +178,9 @@ class ShortTermDataManager:
         """Download ~3 months of daily OHLCV (enough for EMA20/Stochastic/ATR)."""
         try:
             logger.info("Downloading 3-month daily history for %d symbols…", len(ALL_SYMBOLS))
-            raw = yf.download(
-                tickers=ALL_SYMBOLS,
-                period="3mo",
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-            )
+            raw = _download_with_retry(ALL_SYMBOLS, period="3mo")
             if raw.empty:
-                logger.error("yfinance returned empty data")
+                logger.error("yfinance returned empty data after retries")
                 return False
 
             for sym in ALL_SYMBOLS:
@@ -222,41 +256,169 @@ class ShortTermDataManager:
 
     # ── Live price refresh ────────────────────────────────────────────────────
 
-    def update_prices(self) -> None:
-        def _fetch(sym: str):
-            try:
-                fi = yf.Ticker(sym).fast_info
-                price = float(fi.last_price or 0)
-                prev  = float(fi.previous_close or 0)
-                if price > 0 and prev > 0:
-                    return sym, price, prev
-            except Exception as e:
-                logger.debug("fast_info failed %s: %s", sym, e)
-            return None
+    def _fetch_live_prices(self) -> Dict[str, float]:
+        """Current price per symbol from ONE batched intraday request.
 
-        with ThreadPoolExecutor(max_workers=12) as ex:
-            futures = {ex.submit(_fetch, sym): sym for sym in ALL_SYMBOLS}
-            for fut in as_completed(futures):
-                res = fut.result()
-                if res is None:
+        prepost=True so this reflects real pre/after-hours trading. The old
+        per-symbol fast_info loop returned the last *regular session* close
+        during extended hours, and a previous_close that matched no actual
+        bar -- so pre-market moves came out fabricated.
+        """
+        prices: Dict[str, float] = {}
+        try:
+            raw = yf.download(tickers=ALL_SYMBOLS, period="1d", interval="1m",
+                               prepost=True, auto_adjust=False, progress=False, threads=True)
+        except Exception as e:
+            logger.warning("Live price download failed: %s", e)
+            return prices
+
+        if raw is None or raw.empty:
+            return prices
+
+        try:
+            close_block = raw["Close"]
+        except Exception:
+            return prices
+
+        if isinstance(close_block, pd.Series):          # single-ticker shape
+            series = close_block.dropna()
+            if not series.empty and len(ALL_SYMBOLS) == 1:
+                prices[ALL_SYMBOLS[0]] = float(series.iloc[-1])
+            return prices
+
+        for sym in close_block.columns:
+            series = close_block[sym].dropna()
+            if series.empty:
+                continue
+            val = float(series.iloc[-1])
+            if val > 0:
+                prices[str(sym)] = val
+        return prices
+
+    def _last_bar_is_today(self, hist: pd.DataFrame) -> bool:
+        """True when the final daily bar belongs to the current ET session."""
+        try:
+            import pytz
+            today_et = datetime.now(pytz.timezone("America/New_York")).date()
+            return hist.index[-1].date() == today_et
+        except Exception:
+            return False
+
+    def _reference_close(self, sym: str) -> float:
+        """Last COMPLETED regular-session close -- the correct baseline for
+        a change %. If today's (partial) bar is present, step back one."""
+        hist = self._hist.get(sym)
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return 0.0
+        idx = -2 if (self._last_bar_is_today(hist) and len(hist) >= 2) else -1
+        try:
+            return float(hist["Close"].iloc[idx])
+        except Exception:
+            return 0.0
+
+    def update_prices(self) -> None:
+        prices = self._fetch_live_prices()
+        if not prices:
+            return
+
+        session_open = self.market_status() == "OPEN"
+        self._refresh_daily_history_if_stale(session_open)
+
+        with self._lock:
+            for sym, price in prices.items():
+                snap = self._snapshots.get(sym)
+                if snap is None:
                     continue
-                sym, price, prev = res
-                pct = ((price - prev) / prev * 100) if prev else 0.0
-                with self._lock:
-                    snap = self._snapshots[sym]
-                    snap.price      = price
-                    snap.prev_close = prev
-                    snap.change_pct = pct
-                    snap.last_price_update = datetime.now()
-                    if sym in self._hist:
-                        self._hist[sym].iloc[-1, self._hist[sym].columns.get_loc("Close")] = price
-                    _compute_signal(snap)
+                ref = self._reference_close(sym)
+                if ref <= 0:
+                    continue
+
+                snap.price      = price
+                snap.prev_close = ref
+                snap.change_pct = (price - ref) / ref * 100
+                snap.last_price_update = datetime.now()
+
+                # Only the live regular session has a genuinely partial last
+                # bar. Pre/after-hours it is a COMPLETED bar, and patching it
+                # would corrupt the history the indicators score off.
+                hist = self._hist.get(sym)
+                if session_open and hist is not None and self._last_bar_is_today(hist):
+                    hist.iloc[-1, hist.columns.get_loc("Close")] = price
+
+                _compute_signal(snap)
+
+    def _refresh_daily_history_if_stale(self, session_open: bool) -> None:
+        """Re-pull daily bars once, the first time we trade a session whose bar
+        we don't have yet -- e.g. the app was started pre-market, so history
+        ends at yesterday, and the market has since opened."""
+        if not session_open or self._hist_refreshed_for == datetime.now().date():
+            return
+        sample = next(iter(self._hist.values()), None)
+        if sample is not None and self._last_bar_is_today(sample):
+            return
+
+        logger.info("Market opened since startup -- refreshing daily history")
+        self._hist_refreshed_for = datetime.now().date()
+        try:
+            raw = _download_with_retry(ALL_SYMBOLS, period="3mo")
+            if raw.empty:
+                return
+            for sym in ALL_SYMBOLS:
+                df = self._extract(raw, sym)
+                if df is not None and len(df) >= 10:
+                    self._hist[sym] = df
+                    self._apply_technicals(sym, df)
+        except Exception as e:
+            logger.warning("Daily history refresh failed: %s", e)
 
     # ── Catalyst refresh ──────────────────────────────────────────────────────
 
+    def _rotating_slice(self, exclude: set, count: int) -> List[str]:
+        """Next `count` symbols from a cursor walking the universe, skipping
+        anything already selected -- so every name eventually gets catalyst
+        coverage, not just the technical leaders."""
+        if count <= 0:
+            return []
+        picked, n = [], len(ALL_SYMBOLS)
+        for _ in range(n):
+            sym = ALL_SYMBOLS[self._rotate_idx % n]
+            self._rotate_idx = (self._rotate_idx + 1) % n
+            if sym not in exclude:
+                picked.append(sym)
+                if len(picked) >= count:
+                    break
+        return picked
+
+    def _select_catalyst_symbols(self) -> List[str]:
+        """Tier 2 selection. Catalyst work costs ~1s and ~5 Yahoo API calls per
+        symbol, so it runs only on names that can change a decision: the
+        strongest setups, the weakest (so SELL signals stay informed), anything
+        currently held, plus a rotating slice so selection isn't purely
+        circular on technical rank."""
+        with self._lock:
+            ranked = sorted(
+                (s for s in self._snapshots.values() if not s.is_loading),
+                key=lambda s: s.short_score, reverse=True,
+            )
+            priority = set(self._priority_symbols)
+
+        if not ranked:
+            return list(ALL_SYMBOLS[:CATALYST_TOP_N])
+
+        top    = [s.symbol for s in ranked[:CATALYST_TOP_N]]
+        bottom = [s.symbol for s in ranked[-CATALYST_BOTTOM_N:]]
+        chosen = set(top) | set(bottom) | priority
+        rotating = self._rotating_slice(chosen, CATALYST_ROTATE_N)
+
+        # dict.fromkeys keeps order while de-duplicating
+        selected = list(dict.fromkeys(top + bottom + sorted(priority) + rotating))
+        return [s for s in selected if s in self._snapshots]
+
     def _refresh_catalysts(self) -> None:
+        symbols = self._select_catalyst_symbols()
+        logger.info("Catalyst refresh: %d of %d symbols", len(symbols), len(ALL_SYMBOLS))
         with ThreadPoolExecutor(max_workers=8) as ex:
-            futures = {ex.submit(fetch_catalyst, sym): sym for sym in ALL_SYMBOLS}
+            futures = {ex.submit(fetch_catalyst, sym): sym for sym in symbols}
             for fut in as_completed(futures):
                 sym = futures[fut]
                 try:

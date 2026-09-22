@@ -196,6 +196,9 @@ class DashboardWindow:
 
         if self.trader is not None:
             self.trader.run(snapshots)
+            # Held names always get full catalyst analysis, so exit decisions
+            # aren't made on technicals alone under tiered analysis.
+            self.dm.set_priority_symbols(self.trader.positions.keys())
             self._refresh_performance()
 
         self.root.after(REFRESH_MS, self._refresh)
